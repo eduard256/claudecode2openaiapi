@@ -136,24 +136,46 @@ func (p *Process) read(stdout io.ReadCloser) {
 
 func (p *Process) handleStreamEvent(raw json.RawMessage) {
 	var ev struct {
-		Type  string          `json:"type"`
-		Delta json.RawMessage `json:"delta"`
+		Type    string          `json:"type"`
+		Delta   json.RawMessage `json:"delta"`
+		Message json.RawMessage `json:"message"`
+		Usage   json.RawMessage `json:"usage"`
 	}
 	if err := json.Unmarshal(raw, &ev); err != nil {
 		return
 	}
-	if ev.Type != "content_block_delta" {
-		return
-	}
-	var d struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	}
-	if err := json.Unmarshal(ev.Delta, &d); err != nil {
-		return
-	}
-	if d.Type == "text_delta" && d.Text != "" {
-		p.send(Event{TextDelta: d.Text})
+
+	switch ev.Type {
+	case "content_block_delta":
+		var d struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}
+		if err := json.Unmarshal(ev.Delta, &d); err != nil {
+			return
+		}
+		if d.Type == "text_delta" && d.Text != "" {
+			p.send(Event{TextDelta: d.Text})
+		}
+
+	case "message_start":
+		// Usage on message_start has accurate input/cache numbers.
+		var msg struct {
+			Usage json.RawMessage `json:"usage"`
+		}
+		if err := json.Unmarshal(ev.Message, &msg); err != nil {
+			return
+		}
+		if u, ok := parseUsage(msg.Usage); ok {
+			p.send(Event{Usage: u})
+		}
+
+	case "message_delta":
+		// Each message_delta carries an updated output_tokens count. The
+		// last one we see before kill has the most accurate output count.
+		if u, ok := parseUsage(ev.Usage); ok {
+			p.send(Event{Usage: u})
+		}
 	}
 }
 

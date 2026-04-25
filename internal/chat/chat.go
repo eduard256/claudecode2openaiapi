@@ -79,11 +79,11 @@ func streamResponse(w http.ResponseWriter, r *http.Request, req *openai.ChatRequ
 
 	parser := toolproto.NewStream()
 	var (
-		usage         *claudecli.Usage
-		sentRole      bool
-		gotToolBlock  bool
-		errSeen       error
-		clientGone    = r.Context().Done()
+		usage        claudecli.Usage // accumulated max-of-fields across events
+		sentRole     bool
+		gotToolBlock bool
+		errSeen      error
+		clientGone   = r.Context().Done()
 	)
 
 	emit := func(c openai.ChunkDelta, finish *string) {
@@ -113,7 +113,7 @@ loop:
 				continue
 			}
 			if e.Usage != nil {
-				usage = e.Usage
+				mergeUsage(&usage, e.Usage)
 				continue
 			}
 			if e.Done {
@@ -141,6 +141,12 @@ loop:
 	if errSeen != nil {
 		finish = "stop"
 	}
+	// Flush any text the parser was holding back as a possible wrapper prefix.
+	if !gotToolBlock {
+		if tail := parser.Flush(); tail != "" {
+			emit(openai.ChunkDelta{Content: tail}, nil)
+		}
+	}
 	if gotToolBlock {
 		finish = "tool_calls"
 		// Emit tool_calls as one or more delta chunks. We pick the simplest
@@ -164,7 +170,7 @@ loop:
 
 	emit(openai.ChunkDelta{}, &finish)
 
-	if req.StreamOptions != nil && req.StreamOptions.IncludeUsage && usage != nil {
+	if req.StreamOptions != nil && req.StreamOptions.IncludeUsage {
 		_ = wr.Write(openai.StreamChunk{
 			ID: id, Object: "chat.completion.chunk", Created: created, Model: req.Model,
 			Choices: []openai.ChunkChoice{},
@@ -179,11 +185,29 @@ loop:
 	wr.Done()
 }
 
+// mergeUsage takes the max of each field. Different stream events report
+// different subsets (message_start has input, message_delta has output,
+// final result has both) — taking max gives us the union.
+func mergeUsage(dst *claudecli.Usage, src *claudecli.Usage) {
+	if src.InputTokens > dst.InputTokens {
+		dst.InputTokens = src.InputTokens
+	}
+	if src.OutputTokens > dst.OutputTokens {
+		dst.OutputTokens = src.OutputTokens
+	}
+	if src.CacheCreationTokens > dst.CacheCreationTokens {
+		dst.CacheCreationTokens = src.CacheCreationTokens
+	}
+	if src.CacheReadTokens > dst.CacheReadTokens {
+		dst.CacheReadTokens = src.CacheReadTokens
+	}
+}
+
 // bufferResponse collects everything into a single non-streaming response.
 func bufferResponse(w http.ResponseWriter, req *openai.ChatRequest, proc *claudecli.Process) {
 	parser := toolproto.NewStream()
 	var (
-		usage      *claudecli.Usage
+		usage      claudecli.Usage
 		visibleTxt strings.Builder
 		gotTool    bool
 		errSeen    error
@@ -195,7 +219,7 @@ func bufferResponse(w http.ResponseWriter, req *openai.ChatRequest, proc *claude
 			continue
 		}
 		if e.Usage != nil {
-			usage = e.Usage
+			mergeUsage(&usage, e.Usage)
 			continue
 		}
 		if e.Done || e.TextDelta == "" {
@@ -212,6 +236,10 @@ func bufferResponse(w http.ResponseWriter, req *openai.ChatRequest, proc *claude
 			proc.Kill()
 			break
 		}
+	}
+	// Flush parser tail for non-streaming buffered response too.
+	if !gotTool {
+		visibleTxt.WriteString(parser.Flush())
 	}
 
 	if errSeen != nil {
@@ -249,12 +277,10 @@ func bufferResponse(w http.ResponseWriter, req *openai.ChatRequest, proc *claude
 		choice.FinishReason = "tool_calls"
 	}
 	resp.Choices = []openai.Choice{choice}
-	if usage != nil {
-		resp.Usage = openai.Usage{
-			PromptTokens:     usage.InputTokens,
-			CompletionTokens: usage.OutputTokens,
-			TotalTokens:      usage.InputTokens + usage.OutputTokens,
-		}
+	resp.Usage = openai.Usage{
+		PromptTokens:     usage.InputTokens,
+		CompletionTokens: usage.OutputTokens,
+		TotalTokens:      usage.InputTokens + usage.OutputTokens,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)

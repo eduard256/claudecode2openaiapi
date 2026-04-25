@@ -62,9 +62,13 @@ func CleanAssistant(text string) string {
 // Stream is an incremental text-stream parser. Feed it chunks, it tells you
 // when wrapper opens and closes so you can decide what to forward to the
 // client (text deltas) and when to kill the subprocess (close wrapper).
+//
+// In StateText we hold back a tail of characters that COULD be the start of
+// "<tool_calls>" — so the client never sees a partial tag leak through.
 type Stream struct {
 	state State
-	buf   strings.Builder
+	buf   strings.Builder // everything ever fed (used by Extract after kill)
+	hold  strings.Builder // pending text that might be a wrapper prefix
 }
 
 // NewStream returns a fresh parser in StateText.
@@ -74,7 +78,7 @@ func NewStream() *Stream { return &Stream{} }
 type Event struct {
 	// TextDelta is non-empty when in plain-text mode and chunk should be forwarded.
 	TextDelta string
-	// WrapperOpened is true when </tool_calls> wrapper just started; stop forwarding text.
+	// WrapperOpened is true when <tool_calls> wrapper just started; stop forwarding text.
 	WrapperOpened bool
 	// WrapperClosed is true when </tool_calls> just appeared; caller should kill subprocess.
 	WrapperClosed bool
@@ -87,18 +91,32 @@ func (p *Stream) Feed(chunk string) Event {
 	for _, r := range chunk {
 		ch := string(r)
 		p.buf.WriteString(ch)
-		s := p.buf.String()
 
 		switch p.state {
 		case StateText:
-			if strings.HasSuffix(s, OpenWrapper) {
+			p.hold.WriteString(ch)
+			h := p.hold.String()
+
+			// Full match -> enter wrapper mode, drop the held prefix.
+			if strings.HasSuffix(h, OpenWrapper) {
 				p.state = StateBetween
+				p.hold.Reset()
 				ev.WrapperOpened = true
 				continue
 			}
-			ev.TextDelta += ch
+			// If the tail of the hold buffer is a possible prefix of
+			// "<tool_calls>", keep holding. Otherwise flush all but the
+			// longest possible-prefix tail as text to the client.
+			cut := len(h) - longestPrefixMatch(h, OpenWrapper)
+			if cut > 0 {
+				ev.TextDelta += h[:cut]
+				rest := h[cut:]
+				p.hold.Reset()
+				p.hold.WriteString(rest)
+			}
 
 		case StateBetween:
+			s := p.buf.String()
 			if strings.HasSuffix(s, OpenCall) {
 				p.state = StateInsideCall
 				continue
@@ -109,12 +127,41 @@ func (p *Stream) Feed(chunk string) Event {
 			}
 
 		case StateInsideCall:
+			s := p.buf.String()
 			if strings.HasSuffix(s, CloseCall) {
 				p.state = StateBetween
 			}
 		}
 	}
 	return ev
+}
+
+// longestPrefixMatch returns the length of the longest suffix of s that is
+// also a prefix of pattern. Used to decide how much of the hold buffer must
+// stay buffered because it might still grow into the full tag.
+func longestPrefixMatch(s, pattern string) int {
+	max := len(pattern) - 1
+	if max > len(s) {
+		max = len(s)
+	}
+	for n := max; n > 0; n-- {
+		if strings.HasSuffix(s, pattern[:n]) {
+			return n
+		}
+	}
+	return 0
+}
+
+// Flush drains any text held in the prefix-buffer. Call this when the
+// upstream stream ends in StateText — otherwise the trailing characters
+// would never reach the client.
+func (p *Stream) Flush() string {
+	if p.state != StateText {
+		return ""
+	}
+	out := p.hold.String()
+	p.hold.Reset()
+	return out
 }
 
 // Buffered returns everything seen so far (used by Extract after kill).
