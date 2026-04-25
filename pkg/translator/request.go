@@ -13,6 +13,10 @@ import (
 type Result struct {
 	SystemPrompt string
 	StdinLines   []string
+	// UserTurns is the count of "user" messages in StdinLines. Claude CLI
+	// will process them sequentially, producing one Anthropic API call per
+	// user turn — only the LAST turn's deltas are the real reply.
+	UserTurns int
 }
 
 // OpenAIToClaude is the main converter. Given an OpenAI ChatRequest, it
@@ -97,7 +101,26 @@ func OpenAIToClaude(req *openai.ChatRequest) (*Result, error) {
 		}
 	}
 
-	return &Result{SystemPrompt: system, StdinLines: lines}, nil
+	return &Result{SystemPrompt: system, StdinLines: lines, UserTurns: countUserTurns(lines)}, nil
+}
+
+// countUserTurns parses each emitted stream-json line and counts those whose
+// outer "type" is "user". Needed so the chat handler knows how many CLI
+// sub-turns to skip before forwarding deltas to the client.
+func countUserTurns(lines []string) int {
+	n := 0
+	for _, l := range lines {
+		var env struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal([]byte(l), &env); err != nil {
+			continue
+		}
+		if env.Type == "user" {
+			n++
+		}
+	}
+	return n
 }
 
 // messageText returns the plain string of a content field that is either
@@ -168,41 +191,47 @@ func userContent(raw json.RawMessage) ([]map[string]any, error) {
 	return out, nil
 }
 
-// assistantContent builds native blocks for an assistant turn that may have
-// text content, tool_calls, or both.
+// assistantContent serializes an assistant turn into a single text block
+// that mirrors the XML protocol the model itself produces. We DO NOT use
+// native Anthropic tool_use blocks here — the model gets confused when its
+// own free-form output (XML) is later replayed as native blocks with ids it
+// never picked. Mirroring the XML in history is consistent.
 func assistantContent(m openai.Message) []map[string]any {
-	var out []map[string]any
+	var b strings.Builder
 
 	if s, _ := messageText(m.Content); s != "" {
-		out = append(out, map[string]any{"type": "text", "text": s})
+		b.WriteString(s)
 	}
-	for _, tc := range m.ToolCalls {
-		var args any
-		if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
-			args = tc.Function.Arguments
+	if len(m.ToolCalls) > 0 {
+		if b.Len() > 0 {
+			b.WriteString("\n")
 		}
-		out = append(out, map[string]any{
-			"type":  "tool_use",
-			"id":    tc.ID,
-			"name":  tc.Function.Name,
-			"input": args,
-		})
+		b.WriteString("<tool_calls>\n")
+		for _, tc := range m.ToolCalls {
+			args := tc.Function.Arguments
+			if args == "" {
+				args = "{}"
+			}
+			b.WriteString(`<tool_call>{"name":"`)
+			b.WriteString(tc.Function.Name)
+			b.WriteString(`","arguments":`)
+			b.WriteString(args)
+			b.WriteString("}</tool_call>\n")
+		}
+		b.WriteString("</tool_calls>")
 	}
-	return out
+	return []map[string]any{{"type": "text", "text": b.String()}}
 }
 
-// toolResultBlock converts an OpenAI role:tool message to an Anthropic
-// tool_result content block.
+// toolResultBlock formats a tool result as a plain-text <tool_result> XML
+// element matching the protocol described in the system prompt.
 func toolResultBlock(m openai.Message) (map[string]any, error) {
 	content, err := messageText(m.Content)
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{
-		"type":         "tool_result",
-		"tool_use_id":  m.ToolCallID,
-		"content":      content,
-	}, nil
+	body := "<tool_result>" + content + "</tool_result>"
+	return map[string]any{"type": "text", "text": body}, nil
 }
 
 func marshalMsg(role string, content []map[string]any) string {

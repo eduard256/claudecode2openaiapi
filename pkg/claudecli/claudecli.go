@@ -129,6 +129,7 @@ func (p *Process) read(stdout io.ReadCloser) {
 				_ = json.Unmarshal(env["result"], &msg)
 				p.send(Event{Err: errors.New("claudecli: " + msg)})
 			}
+			p.send(Event{TurnEnd: true})
 		}
 	}
 	p.send(Event{Done: true})

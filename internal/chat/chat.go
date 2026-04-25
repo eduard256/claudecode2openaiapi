@@ -53,10 +53,18 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Claude CLI replays the conversation: it makes one Anthropic API call
+	// per user message in the input stream. We must ignore everything from
+	// turns 1..N-1 and only stream the final turn's output to the client.
+	skipTurns := tr.UserTurns - 1
+	if skipTurns < 0 {
+		skipTurns = 0
+	}
+
 	if req.Stream {
-		streamResponse(w, r, &req, proc)
+		streamResponse(w, r, &req, proc, skipTurns)
 	} else {
-		bufferResponse(w, &req, proc)
+		bufferResponse(w, &req, proc, skipTurns)
 	}
 }
 
@@ -72,7 +80,7 @@ func modelAlias(m string) string {
 }
 
 // streamResponse drives the SSE flow.
-func streamResponse(w http.ResponseWriter, r *http.Request, req *openai.ChatRequest, proc *claudecli.Process) {
+func streamResponse(w http.ResponseWriter, r *http.Request, req *openai.ChatRequest, proc *claudecli.Process, skipTurns int) {
 	id := openai.CompletionID()
 	created := time.Now().Unix()
 	wr := sse.NewWriter(w)
@@ -98,6 +106,10 @@ func streamResponse(w http.ResponseWriter, r *http.Request, req *openai.ChatRequ
 	sentRole = true
 	_ = sentRole
 
+	// turnIdx counts how many CLI turns we've seen. We forward deltas to
+	// the client only when turnIdx == skipTurns (the final turn).
+	turnIdx := 0
+
 loop:
 	for {
 		select {
@@ -112,14 +124,29 @@ loop:
 				errSeen = e.Err
 				continue
 			}
-			if e.Usage != nil {
+			if e.Usage != nil && turnIdx == skipTurns {
 				mergeUsage(&usage, e.Usage)
+				continue
+			}
+			if e.TurnEnd {
+				turnIdx++
+				if turnIdx > skipTurns {
+					// Final turn done — stop reading more events.
+					break loop
+				}
+				// Earlier turn — discard its accumulated state.
+				parser = toolproto.NewStream()
+				gotToolBlock = false
 				continue
 			}
 			if e.Done {
 				continue
 			}
 			if e.TextDelta == "" {
+				continue
+			}
+			if turnIdx < skipTurns {
+				// Still replaying earlier turns — drop everything silently.
 				continue
 			}
 
@@ -204,7 +231,7 @@ func mergeUsage(dst *claudecli.Usage, src *claudecli.Usage) {
 }
 
 // bufferResponse collects everything into a single non-streaming response.
-func bufferResponse(w http.ResponseWriter, req *openai.ChatRequest, proc *claudecli.Process) {
+func bufferResponse(w http.ResponseWriter, req *openai.ChatRequest, proc *claudecli.Process, skipTurns int) {
 	parser := toolproto.NewStream()
 	var (
 		usage      claudecli.Usage
@@ -213,16 +240,30 @@ func bufferResponse(w http.ResponseWriter, req *openai.ChatRequest, proc *claude
 		errSeen    error
 	)
 
+	turnIdx := 0
 	for e := range proc.Events {
 		if e.Err != nil {
 			errSeen = e.Err
 			continue
 		}
-		if e.Usage != nil {
+		if e.Usage != nil && turnIdx == skipTurns {
 			mergeUsage(&usage, e.Usage)
 			continue
 		}
+		if e.TurnEnd {
+			turnIdx++
+			if turnIdx > skipTurns {
+				break
+			}
+			parser = toolproto.NewStream()
+			gotTool = false
+			visibleTxt.Reset()
+			continue
+		}
 		if e.Done || e.TextDelta == "" {
+			continue
+		}
+		if turnIdx < skipTurns {
 			continue
 		}
 		ev := parser.Feed(e.TextDelta)
